@@ -1,0 +1,238 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ========================================
+// 顧客（建設会社）
+// ========================================
+model Customer {
+  id          String   @id @default(uuid())
+  companyName String
+  contactName String
+  email       String
+  phone       String   @default("")
+  address     String   @default("")
+  kintoneId   String   @default("")
+  notes       String   @default("")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  projects Project[]
+}
+
+// ========================================
+// 案件（プロジェクト）
+// ========================================
+model Project {
+  id              String        @id @default(uuid())
+  projectName     String
+  projectCode     String        @unique
+  customerId      String
+  customer        Customer      @relation(fields: [customerId], references: [id])
+  salesAmount     Float         @default(0)
+  status          String        @default("hearing") // hearing, partner_selection, negotiation, contract, in_progress, qa, qc_review, integration, delivered, completed
+  pmName          String        @default("")
+  googleDriveUrl  String        @default("")
+  kintoneId       String        @default("")
+  notes           String        @default("")
+  startDate       DateTime?
+  deadline        DateTime?
+  deliveredAt     DateTime?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  hearingSheet     HearingSheet?
+  assignments      ProjectAssignment[]
+  documents        Document[]
+  qaSheets         QASheet[]
+  deliverables     Deliverable[]
+  notifications    Notification[]
+}
+
+// ========================================
+// ヒアリングシート（④）
+// ========================================
+model HearingSheet {
+  id                  String   @id @default(uuid())
+  projectId           String   @unique
+  project             Project  @relation(fields: [projectId], references: [id])
+  buildingType        String   @default("")  // 建物用途
+  structureType       String   @default("")  // 構造
+  floors              String   @default("")  // 階数
+  totalFloorArea      String   @default("")  // 延床面積
+  estimationScope     String   @default("")  // 積算範囲（工種）
+  requiredWorkTypes   String   @default("")  // JSON配列: 必要な工種リスト
+  drawingFormat       String   @default("")  // 図面形式
+  softwarePreference  String   @default("")  // 使用ソフト指定
+  deadline            DateTime?
+  specialNotes        String   @default("")  // 特記事項
+  customerRequests    String   @default("")  // お客様要望
+  status              String   @default("draft") // draft, completed
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+}
+
+// ========================================
+// 積算パートナー
+// ========================================
+model Partner {
+  id              String   @id @default(uuid())
+  name            String
+  email           String   @unique
+  phone           String   @default("")
+  skillLevel      String   @default("mid") // junior, mid, senior, expert
+  workTypes       String   @default("")    // JSON配列: 対応可能な工種
+  specialties     String   @default("")    // 得意分野
+  availableStatus String   @default("available") // available, busy, unavailable
+  currentLoad     Int      @default(0)     // 現在の担当案件数
+  maxLoad         Int      @default(3)     // 最大同時案件数
+  rating          Float    @default(3.0)   // 評価（5段階）
+  hourlyRate      Float    @default(0)     // 基本時間単価
+  notes           String   @default("")
+  isActive        Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  assignments  ProjectAssignment[]
+  deliverables Deliverable[]
+}
+
+// ========================================
+// 案件アサイン（⑤パートナー選定）
+// ========================================
+model ProjectAssignment {
+  id                String   @id @default(uuid())
+  projectId         String
+  project           Project  @relation(fields: [projectId], references: [id])
+  partnerId         String
+  partner           Partner  @relation(fields: [partnerId], references: [id])
+  workType          String               // 担当工種
+  proposedFee       Float    @default(0)  // 提示報酬額
+  agreedFee         Float    @default(0)  // 合意報酬額（⑥）
+  feeStatus         String   @default("pending") // pending, proposed, negotiating, agreed
+  contractStatus    String   @default("none") // none, sent, signed, started_without_contract（⑦）
+  contractSentAt    DateTime?
+  contractSignedAt  DateTime?
+  workStatus        String   @default("not_started") // not_started, in_progress, submitted, revision, completed
+  notes             String   @default("")
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@unique([projectId, partnerId, workType])
+}
+
+// ========================================
+// ドキュメント管理（⑨追加図面・情報配信）
+// ========================================
+model Document {
+  id              String   @id @default(uuid())
+  projectId       String
+  project         Project  @relation(fields: [projectId], references: [id])
+  documentType    String           // drawing(図面), specification(仕様書), reference(参考資料), additional_info(追加情報)
+  fileName        String
+  fileUrl         String   @default("")
+  description     String   @default("")
+  distributedToAll Boolean @default(false) // 全パートナーに配信済みか
+  distributedAt   DateTime?
+  uploadedBy      String   @default("")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+// ========================================
+// 質疑書管理（⑧⑨質疑統合・回答配信）
+// ========================================
+model QASheet {
+  id              String   @id @default(uuid())
+  projectId       String
+  project         Project  @relation(fields: [projectId], references: [id])
+  qaType          String   @default("question") // question(質疑書), pre_confirmation(事前確認書)
+  workType        String   @default("")         // 工種カテゴリ
+  status          String   @default("draft")    // draft, consolidated, sent_to_customer, answered, distributed
+  sentToCustomerAt DateTime?
+  answeredAt       DateTime?
+  distributedAt    DateTime?
+  notes           String   @default("")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  items QAItem[]
+}
+
+model QAItem {
+  id              String   @id @default(uuid())
+  qaSheetId       String
+  qaSheet         QASheet  @relation(fields: [qaSheetId], references: [id])
+  questionNumber  Int
+  partnerName     String   @default("")  // 質問元パートナー
+  workType        String   @default("")  // 工種
+  question        String
+  answer          String   @default("")
+  status          String   @default("open") // open, answered
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+// ========================================
+// 成果物管理（⑩⑪⑫）
+// ========================================
+model Deliverable {
+  id              String   @id @default(uuid())
+  projectId       String
+  project         Project  @relation(fields: [projectId], references: [id])
+  partnerId       String
+  partner         Partner  @relation(fields: [partnerId], references: [id])
+  workType        String
+  fileName        String
+  fileUrl         String   @default("")
+  version         Int      @default(1)
+  status          String   @default("submitted") // submitted, qc_review, revision_requested, revision_submitted, approved, integrated
+  needsQC         Boolean  @default(true)
+  qcReviewerName  String   @default("")
+  qcNotes         String   @default("")
+  submittedAt     DateTime @default(now())
+  reviewedAt      DateTime?
+  approvedAt      DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  revisions DeliverableRevision[]
+}
+
+model DeliverableRevision {
+  id              String   @id @default(uuid())
+  deliverableId   String
+  deliverable     Deliverable @relation(fields: [deliverableId], references: [id])
+  revisionNumber  Int
+  revisionNotes   String   @default("")   // 修正指示内容
+  responseNotes   String   @default("")   // パートナーからの回答
+  fileName        String   @default("")
+  fileUrl         String   @default("")
+  status          String   @default("requested") // requested, submitted, approved
+  requestedAt     DateTime @default(now())
+  submittedAt     DateTime?
+  reviewedAt      DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+// ========================================
+// 通知ログ
+// ========================================
+model Notification {
+  id          String   @id @default(uuid())
+  projectId   String
+  project     Project  @relation(fields: [projectId], references: [id])
+  type        String           // email, system
+  recipient   String
+  subject     String
+  body        String   @default("")
+  sentAt      DateTime @default(now())
+  status      String   @default("sent") // sent, failed
+  createdAt   DateTime @default(now())
+}
