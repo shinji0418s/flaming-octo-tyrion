@@ -22,6 +22,7 @@ export async function GET(_req: NextRequest, { params }: { params: Promise<{ id:
         orderBy: { createdAt: "desc" },
       },
       notifications: { orderBy: { createdAt: "desc" }, take: 20 },
+      emailDrafts: { orderBy: { createdAt: "desc" } },
     },
   });
   if (!project) {

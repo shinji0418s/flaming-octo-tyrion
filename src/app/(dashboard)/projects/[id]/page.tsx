@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
 import StatusBadge from "@/components/ui/StatusBadge";
@@ -33,6 +33,7 @@ interface Project {
   qaSheets: QASheet[];
   deliverables: Deliverable[];
   notifications: Notification[];
+  emailDrafts: EmailDraft[];
 }
 
 interface HearingSheet {
@@ -96,7 +97,7 @@ interface QAItem {
 interface Deliverable {
   id: string;
   partnerId: string;
-  partner: { name: string };
+  partner: { name: string; email: string };
   workType: string;
   fileName: string;
   fileUrl: string;
@@ -125,6 +126,22 @@ interface Notification {
   sentAt: string;
 }
 
+interface EmailDraft {
+  id: string;
+  emailType: string;
+  recipientEmail: string;
+  recipientName: string;
+  subject: string;
+  body: string;
+  attachmentInfo: string;
+  status: string;
+  aiGenerated: boolean;
+  pmNotes: string;
+  approvedAt: string | null;
+  sentAt: string | null;
+  createdAt: string;
+}
+
 const WORKFLOW_STEPS = [
   { key: "hearing", label: "④ ヒアリング", statuses: ["hearing"] },
   { key: "partner", label: "⑤ パートナー選定", statuses: ["partner_selection"] },
@@ -136,20 +153,39 @@ const WORKFLOW_STEPS = [
   { key: "integration", label: "⑫ 統合・納品", statuses: ["integration", "delivered"] },
 ];
 
+const EMAIL_TYPE_LABELS: Record<string, string> = {
+  partner_assignment: "案件依頼",
+  document_distribution: "資料配信",
+  qa_to_customer: "質疑書送付",
+  qa_answer_distribution: "質疑回答配信",
+  revision_request: "修正依頼",
+  deliverable_reminder: "進捗確認",
+  customer_reply: "顧客返信",
+  delivery_notification: "納品通知",
+  general: "一般",
+};
+
+const EMAIL_STATUS_LABELS: Record<string, string> = {
+  draft: "下書き",
+  approved: "承認済み",
+  sent: "送信済み",
+  rejected: "却下",
+};
+
 export default function ProjectDetailPage() {
   const params = useParams();
   const [project, setProject] = useState<Project | null>(null);
   const [activeTab, setActiveTab] = useState("overview");
   const [loading, setLoading] = useState(true);
 
-  const fetchProject = () => {
+  const fetchProject = useCallback(() => {
     fetch(`/api/projects/${params.id}`)
       .then((r) => r.json())
       .then(setProject)
       .finally(() => setLoading(false));
-  };
+  }, [params.id]);
 
-  useEffect(() => { fetchProject(); }, [params.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { fetchProject(); }, [fetchProject]);
 
   if (loading || !project) {
     return <div className="p-8 text-gray-500">読み込み中...</div>;
@@ -159,6 +195,8 @@ export default function ProjectDetailPage() {
     s.statuses.includes(project.status)
   );
 
+  const draftCount = project.emailDrafts.filter((d) => d.status === "draft").length;
+
   const tabs = [
     { key: "overview", label: "概要" },
     { key: "hearing", label: "④ ヒアリング" },
@@ -166,6 +204,7 @@ export default function ProjectDetailPage() {
     { key: "documents", label: "⑨ 資料配信" },
     { key: "qa", label: "⑧⑨ 質疑管理" },
     { key: "deliverables", label: "⑩⑪⑫ 成果物" },
+    { key: "emails", label: `AI メール管理${draftCount > 0 ? ` (${draftCount})` : ""}` },
     { key: "notifications", label: "通知ログ" },
   ];
 
@@ -230,8 +269,11 @@ export default function ProjectDetailPage() {
                 activeTab === tab.key
                   ? "border-blue-600 text-blue-600"
                   : "border-transparent text-gray-500 hover:text-gray-700"
-              }`}
+              } ${tab.key === "emails" ? "relative" : ""}`}
             >
+              {tab.key === "emails" && draftCount > 0 && (
+                <span className="absolute -top-1 -right-1 w-4 h-4 bg-red-500 text-white text-[10px] rounded-full flex items-center justify-center">{draftCount}</span>
+              )}
               {tab.label}
             </button>
           ))}
@@ -245,6 +287,7 @@ export default function ProjectDetailPage() {
       {activeTab === "documents" && <DocumentsTab project={project} onUpdate={fetchProject} />}
       {activeTab === "qa" && <QATab project={project} onUpdate={fetchProject} />}
       {activeTab === "deliverables" && <DeliverablesTab project={project} onUpdate={fetchProject} />}
+      {activeTab === "emails" && <EmailManagementTab project={project} onUpdate={fetchProject} />}
       {activeTab === "notifications" && <NotificationsTab project={project} />}
     </div>
   );
@@ -286,7 +329,7 @@ function OverviewTab({ project }: { project: Project }) {
   );
 }
 
-// ===== ④ ヒアリングタブ =====
+// ===== ④ ヒアリングタブ（AI要約自動入力付き） =====
 function HearingTab({ project, onUpdate }: { project: Project; onUpdate: () => void }) {
   const hs = project.hearingSheet;
   const [form, setForm] = useState({
@@ -302,6 +345,40 @@ function HearingTab({ project, onUpdate }: { project: Project; onUpdate: () => v
     customerRequests: hs?.customerRequests || "",
     status: hs?.status || "draft",
   });
+  const [aiSummary, setAiSummary] = useState("");
+  const [aiParsing, setAiParsing] = useState(false);
+  const [aiResult, setAiResult] = useState<string | null>(null);
+
+  const handleAIParse = async () => {
+    if (!aiSummary.trim()) return;
+    setAiParsing(true);
+    setAiResult(null);
+    try {
+      const res = await fetch("/api/ai/parse-hearing", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ summary: aiSummary }),
+      });
+      const parsed = await res.json();
+      setForm((prev) => ({
+        ...prev,
+        buildingType: parsed.buildingType || prev.buildingType,
+        structureType: parsed.structureType || prev.structureType,
+        floors: parsed.floors || prev.floors,
+        totalFloorArea: parsed.totalFloorArea || prev.totalFloorArea,
+        estimationScope: parsed.estimationScope || prev.estimationScope,
+        requiredWorkTypes: parsed.requiredWorkTypes || prev.requiredWorkTypes,
+        drawingFormat: parsed.drawingFormat || prev.drawingFormat,
+        softwarePreference: parsed.softwarePreference || prev.softwarePreference,
+        specialNotes: parsed.specialNotes || prev.specialNotes,
+        customerRequests: parsed.customerRequests || prev.customerRequests,
+      }));
+      setAiResult("AIが要約から各項目を自動入力しました。内容を確認して必要に応じて修正してください。");
+    } catch {
+      setAiResult("解析に失敗しました。手動で入力してください。");
+    }
+    setAiParsing(false);
+  };
 
   const handleSave = async () => {
     await fetch(`/api/projects/${project.id}/hearing`, {
@@ -309,71 +386,197 @@ function HearingTab({ project, onUpdate }: { project: Project; onUpdate: () => v
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ...form, status: "completed" }),
     });
+    // ヒアリング完了後、自動でパートナー選定を開始
+    try {
+      await fetch("/api/ai/auto-assign", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ projectId: project.id }),
+      });
+    } catch {
+      // パートナー自動選定が失敗しても続行
+    }
+    // パートナーへの案件依頼メールも自動生成
+    try {
+      await fetch("/api/ai/generate-email", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ projectId: project.id, emailType: "partner_assignment" }),
+      });
+    } catch {
+      // メール生成失敗しても続行
+    }
     onUpdate();
   };
 
   return (
-    <div className="bg-white rounded-lg shadow-sm border p-6">
-      <div className="flex items-center justify-between mb-4">
-        <h3 className="font-semibold text-gray-900">ヒアリングシート</h3>
-        {hs && <StatusBadge status={hs.status} labels={{ draft: "下書き", completed: "完了" }} />}
-      </div>
-      <div className="grid grid-cols-2 gap-4">
-        <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">建物用途</label>
-          <input type="text" value={form.buildingType} onChange={(e) => setForm({ ...form, buildingType: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm" placeholder="事務所、共同住宅 等" />
+    <div className="space-y-6">
+      {/* AI要約入力エリア */}
+      <div className="bg-gradient-to-r from-purple-50 to-blue-50 rounded-lg border-2 border-purple-200 p-6">
+        <div className="flex items-center gap-2 mb-3">
+          <span className="bg-purple-600 text-white text-xs font-bold px-2 py-1 rounded">AI</span>
+          <h3 className="font-semibold text-gray-900">ヒアリング要約からAI自動入力</h3>
         </div>
-        <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">構造</label>
-          <input type="text" value={form.structureType} onChange={(e) => setForm({ ...form, structureType: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm" placeholder="RC造、S造 等" />
-        </div>
-        <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">階数</label>
-          <input type="text" value={form.floors} onChange={(e) => setForm({ ...form, floors: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm" placeholder="地上5階 地下1階" />
-        </div>
-        <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">延床面積</label>
-          <input type="text" value={form.totalFloorArea} onChange={(e) => setForm({ ...form, totalFloorArea: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm" placeholder="5,000㎡" />
-        </div>
-        <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">図面形式</label>
-          <input type="text" value={form.drawingFormat} onChange={(e) => setForm({ ...form, drawingFormat: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm" placeholder="PDF, CAD 等" />
-        </div>
-        <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">使用ソフト指定</label>
-          <input type="text" value={form.softwarePreference} onChange={(e) => setForm({ ...form, softwarePreference: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm" placeholder="Excel, 建築積算ソフト 等" />
-        </div>
-        <div className="col-span-2">
-          <label className="block text-sm font-medium text-gray-700 mb-1">積算範囲（工種）</label>
-          <textarea value={form.estimationScope} onChange={(e) => setForm({ ...form, estimationScope: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm" rows={2} placeholder="建築、構造、電気設備、機械設備 等" />
-        </div>
-        <div className="col-span-2">
-          <label className="block text-sm font-medium text-gray-700 mb-1">特記事項</label>
-          <textarea value={form.specialNotes} onChange={(e) => setForm({ ...form, specialNotes: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm" rows={2} />
-        </div>
-        <div className="col-span-2">
-          <label className="block text-sm font-medium text-gray-700 mb-1">お客様要望</label>
-          <textarea value={form.customerRequests} onChange={(e) => setForm({ ...form, customerRequests: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm" rows={2} />
+        <p className="text-sm text-gray-600 mb-3">
+          お客様とのヒアリング内容やメモをそのまま貼り付けてください。AIが自動で各項目を抽出・入力します。
+        </p>
+        <textarea
+          value={aiSummary}
+          onChange={(e) => setAiSummary(e.target.value)}
+          className="w-full border-2 border-purple-200 rounded-lg px-4 py-3 text-sm focus:border-purple-400 focus:ring-1 focus:ring-purple-400"
+          rows={6}
+          placeholder={`例：
+○○建設様より事務所ビルの積算依頼。RC造、地上8階建て、延床面積約3,500㎡。
+建築と電気設備、空調換気設備の積算が必要。図面はPDFで提供。
+使用ソフトはExcel指定。特記事項として、外壁タイル張り、免震構造。
+お客様要望：納期は厳守でお願いしたい。`}
+        />
+        <div className="flex items-center gap-3 mt-3">
+          <button
+            onClick={handleAIParse}
+            disabled={aiParsing || !aiSummary.trim()}
+            className="px-6 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:opacity-50 text-sm font-medium flex items-center gap-2"
+          >
+            {aiParsing ? (
+              <><span className="animate-spin inline-block w-4 h-4 border-2 border-white border-t-transparent rounded-full" /> AI解析中...</>
+            ) : (
+              <>AI自動入力</>
+            )}
+          </button>
+          {aiResult && (
+            <p className="text-sm text-purple-700 font-medium">{aiResult}</p>
+          )}
         </div>
       </div>
-      <div className="mt-4">
-        <button onClick={handleSave} className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium">
-          {hs ? "更新してパートナー選定へ" : "保存してパートナー選定へ"}
-        </button>
+
+      {/* ヒアリングシート */}
+      <div className="bg-white rounded-lg shadow-sm border p-6">
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="font-semibold text-gray-900">ヒアリングシート</h3>
+          {hs && <StatusBadge status={hs.status} labels={{ draft: "下書き", completed: "完了" }} />}
+        </div>
+        <div className="grid grid-cols-2 gap-4">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">建物用途</label>
+            <input type="text" value={form.buildingType} onChange={(e) => setForm({ ...form, buildingType: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm" placeholder="事務所、共同住宅 等" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">構造</label>
+            <input type="text" value={form.structureType} onChange={(e) => setForm({ ...form, structureType: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm" placeholder="RC造、S造 等" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">階数</label>
+            <input type="text" value={form.floors} onChange={(e) => setForm({ ...form, floors: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm" placeholder="地上5階 地下1階" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">延床面積</label>
+            <input type="text" value={form.totalFloorArea} onChange={(e) => setForm({ ...form, totalFloorArea: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm" placeholder="5,000㎡" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">図面形式</label>
+            <input type="text" value={form.drawingFormat} onChange={(e) => setForm({ ...form, drawingFormat: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm" placeholder="PDF, CAD 等" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">使用ソフト指定</label>
+            <input type="text" value={form.softwarePreference} onChange={(e) => setForm({ ...form, softwarePreference: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm" placeholder="Excel, 建築積算ソフト 等" />
+          </div>
+          <div className="col-span-2">
+            <label className="block text-sm font-medium text-gray-700 mb-1">積算範囲（工種）</label>
+            <textarea value={form.estimationScope} onChange={(e) => setForm({ ...form, estimationScope: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm" rows={2} placeholder="建築、構造、電気設備、機械設備 等" />
+          </div>
+          <div className="col-span-2">
+            <label className="block text-sm font-medium text-gray-700 mb-1">特記事項</label>
+            <textarea value={form.specialNotes} onChange={(e) => setForm({ ...form, specialNotes: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm" rows={2} />
+          </div>
+          <div className="col-span-2">
+            <label className="block text-sm font-medium text-gray-700 mb-1">お客様要望</label>
+            <textarea value={form.customerRequests} onChange={(e) => setForm({ ...form, customerRequests: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm" rows={2} />
+          </div>
+        </div>
+        <div className="mt-4 flex items-center gap-3">
+          <button onClick={handleSave} className="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium">
+            {hs ? "更新してパートナー自動選定へ" : "保存してパートナー自動選定へ"}
+          </button>
+          <p className="text-xs text-gray-500">
+            保存すると、AIが最適なパートナーを自動選定し、依頼メールの下書きを生成します
+          </p>
+        </div>
       </div>
     </div>
   );
 }
 
-// ===== ⑤⑥⑦ パートナータブ =====
+// ===== ⑤⑥⑦ パートナータブ（AI自動選定付き） =====
 function PartnersTab({ project, onUpdate }: { project: Project; onUpdate: () => void }) {
   const [partners, setPartners] = useState<Array<{ id: string; name: string; email: string; skillLevel: string; workTypes: string; availableStatus: string; currentLoad: number; maxLoad: number; rating: number }>>([]);
   const [showAssignForm, setShowAssignForm] = useState(false);
   const [assignForm, setAssignForm] = useState({ partnerId: "", workType: "", proposedFee: "" });
+  const [autoAssignResult, setAutoAssignResult] = useState<{
+    recommendations: Array<{
+      workType: string;
+      partnerId: string;
+      partnerName: string;
+      partnerEmail: string;
+      skillLevel: string;
+      rating: number;
+      currentLoad: number;
+      maxLoad: number;
+      matchScore: number;
+      matchReasons: string[];
+      proposedFee: number;
+    }>;
+  } | null>(null);
+  const [autoAssigning, setAutoAssigning] = useState(false);
 
   useEffect(() => {
     fetch("/api/partners?available=true").then((r) => r.json()).then(setPartners);
   }, []);
+
+  const handleAutoAssign = async () => {
+    setAutoAssigning(true);
+    try {
+      const res = await fetch("/api/ai/auto-assign", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ projectId: project.id }),
+      });
+      const data = await res.json();
+      if (data.recommendations) {
+        setAutoAssignResult(data);
+      }
+    } catch {
+      // 失敗時は手動選定に
+    }
+    setAutoAssigning(false);
+  };
+
+  const confirmAutoAssign = async (rec: { partnerId: string; workType: string; proposedFee: number }) => {
+    await fetch(`/api/projects/${project.id}/assignments`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        partnerId: rec.partnerId,
+        workType: rec.workType,
+        proposedFee: rec.proposedFee,
+      }),
+    });
+    // 依頼メールを自動生成
+    await fetch("/api/ai/generate-email", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ projectId: project.id, emailType: "partner_assignment" }),
+    });
+    onUpdate();
+    // 結果から確定済みを除外
+    if (autoAssignResult) {
+      setAutoAssignResult({
+        ...autoAssignResult,
+        recommendations: autoAssignResult.recommendations.filter(
+          (r) => !(r.partnerId === rec.partnerId && r.workType === rec.workType)
+        ),
+      });
+    }
+  };
 
   const handleAssign = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -408,14 +611,69 @@ function PartnersTab({ project, onUpdate }: { project: Project; onUpdate: () => 
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <h3 className="font-semibold text-gray-900">パートナーアサイン・報酬交渉・契約管理</h3>
-        <button onClick={() => setShowAssignForm(true)} className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium">
-          + パートナーをアサイン
-        </button>
+        <div className="flex gap-2">
+          <button
+            onClick={handleAutoAssign}
+            disabled={autoAssigning}
+            className="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:opacity-50 text-sm font-medium flex items-center gap-2"
+          >
+            {autoAssigning ? (
+              <><span className="animate-spin inline-block w-4 h-4 border-2 border-white border-t-transparent rounded-full" /> AI選定中...</>
+            ) : (
+              <><span className="text-xs bg-purple-400 px-1 rounded">AI</span> 自動パートナー選定</>
+            )}
+          </button>
+          <button onClick={() => setShowAssignForm(true)} className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium">
+            + 手動アサイン
+          </button>
+        </div>
       </div>
+
+      {/* AI自動選定結果 */}
+      {autoAssignResult && autoAssignResult.recommendations.length > 0 && (
+        <div className="bg-gradient-to-r from-purple-50 to-blue-50 rounded-lg border-2 border-purple-200 p-6">
+          <div className="flex items-center gap-2 mb-4">
+            <span className="bg-purple-600 text-white text-xs font-bold px-2 py-1 rounded">AI</span>
+            <h4 className="font-semibold text-gray-900">AI推奨パートナー</h4>
+            <span className="text-sm text-gray-500">（確認後「アサイン確定」を押してください）</span>
+          </div>
+          <div className="space-y-3">
+            {autoAssignResult.recommendations.map((rec, idx) => (
+              <div key={idx} className="bg-white rounded-lg border p-4 flex items-center justify-between">
+                <div className="flex-1">
+                  <div className="flex items-center gap-3">
+                    <span className="font-medium text-gray-900">{rec.partnerName}</span>
+                    <span className="text-xs bg-gray-100 px-2 py-0.5 rounded">{SKILL_LEVELS[rec.skillLevel as keyof typeof SKILL_LEVELS]}</span>
+                    <span className="text-xs text-yellow-600">★ {rec.rating}</span>
+                    <span className="text-xs text-gray-500">負荷: {rec.currentLoad}/{rec.maxLoad}</span>
+                  </div>
+                  <p className="text-sm text-gray-600 mt-1">
+                    担当工種: <span className="font-medium">{rec.workType}</span> / 報酬: {rec.proposedFee.toLocaleString()}円
+                  </p>
+                  <div className="flex flex-wrap gap-1 mt-1">
+                    {rec.matchReasons.map((reason, i) => (
+                      <span key={i} className="text-xs bg-purple-100 text-purple-700 px-2 py-0.5 rounded">{reason}</span>
+                    ))}
+                  </div>
+                  <div className="mt-1">
+                    <span className="text-xs text-purple-600 font-medium">マッチスコア: {rec.matchScore}点</span>
+                  </div>
+                </div>
+                <button
+                  onClick={() => confirmAutoAssign(rec)}
+                  className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 text-sm font-medium ml-4"
+                >
+                  アサイン確定
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {showAssignForm && (
         <div className="bg-white rounded-lg shadow-sm border p-6">
-          <h4 className="font-medium mb-4">パートナー選定</h4>
+          <h4 className="font-medium mb-4">手動パートナー選定</h4>
           <p className="text-sm text-gray-500 mb-4">案件売上: {project.salesAmount.toLocaleString()}円 / 推奨報酬（50%）: {Math.round(project.salesAmount * 0.5).toLocaleString()}円</p>
           <form onSubmit={handleAssign} className="grid grid-cols-3 gap-4">
             <div>
@@ -526,7 +784,7 @@ function PartnersTab({ project, onUpdate }: { project: Project; onUpdate: () => 
   );
 }
 
-// ===== ⑨ 資料配信タブ =====
+// ===== ⑨ 資料配信タブ（メール自動生成付き） =====
 function DocumentsTab({ project, onUpdate }: { project: Project; onUpdate: () => void }) {
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ fileName: "", documentType: "drawing", fileUrl: "", description: "", distributeToAll: true });
@@ -538,6 +796,18 @@ function DocumentsTab({ project, onUpdate }: { project: Project; onUpdate: () =>
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(form),
     });
+    // 配信メールを自動生成
+    if (form.distributeToAll) {
+      await fetch("/api/ai/generate-email", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          projectId: project.id,
+          emailType: "document_distribution",
+          context: { documentName: form.fileName, documentUrl: form.fileUrl, description: form.description },
+        }),
+      });
+    }
     setShowForm(false);
     setForm({ fileName: "", documentType: "drawing", fileUrl: "", description: "", distributeToAll: true });
     onUpdate();
@@ -583,11 +853,11 @@ function DocumentsTab({ project, onUpdate }: { project: Project; onUpdate: () =>
             <div className="col-span-2">
               <label className="flex items-center gap-2 text-sm">
                 <input type="checkbox" checked={form.distributeToAll} onChange={(e) => setForm({ ...form, distributeToAll: e.target.checked })} />
-                全パートナーに配信する（メール通知）
+                全パートナーに配信する（AIがメール文面を自動生成します）
               </label>
             </div>
             <div className="col-span-2 flex gap-2">
-              <button type="submit" className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm">追加・配信</button>
+              <button type="submit" className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm">追加・配信メール生成</button>
               <button type="button" onClick={() => setShowForm(false)} className="px-4 py-2 bg-gray-200 rounded-lg text-sm">キャンセル</button>
             </div>
           </form>
@@ -628,7 +898,7 @@ function DocumentsTab({ project, onUpdate }: { project: Project; onUpdate: () =>
   );
 }
 
-// ===== ⑧⑨ 質疑管理タブ =====
+// ===== ⑧⑨ 質疑管理タブ（メール自動生成付き） =====
 function QATab({ project, onUpdate }: { project: Project; onUpdate: () => void }) {
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ qaType: "question", workType: "", items: [{ question: "", partnerName: "", workType: "" }] });
@@ -655,6 +925,20 @@ function QATab({ project, onUpdate }: { project: Project; onUpdate: () => void }
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ status }),
     });
+    // ステータスに応じてメールを自動生成
+    if (status === "sent_to_customer") {
+      await fetch("/api/ai/generate-email", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ projectId: project.id, emailType: "qa_to_customer" }),
+      });
+    } else if (status === "distributed") {
+      await fetch("/api/ai/generate-email", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ projectId: project.id, emailType: "qa_answer_distribution" }),
+      });
+    }
     onUpdate();
   };
 
@@ -727,13 +1011,17 @@ function QATab({ project, onUpdate }: { project: Project; onUpdate: () => void }
                 <button onClick={() => updateQAStatus(qa.id, "consolidated")} className="px-3 py-1 bg-blue-600 text-white rounded text-xs">統合完了</button>
               )}
               {qa.status === "consolidated" && (
-                <button onClick={() => updateQAStatus(qa.id, "sent_to_customer")} className="px-3 py-1 bg-yellow-600 text-white rounded text-xs">顧客に送付</button>
+                <button onClick={() => updateQAStatus(qa.id, "sent_to_customer")} className="px-3 py-1 bg-yellow-600 text-white rounded text-xs flex items-center gap-1">
+                  <span className="bg-yellow-400 text-[8px] px-0.5 rounded">AI</span> 顧客にメール送付
+                </button>
               )}
               {qa.status === "sent_to_customer" && (
                 <button onClick={() => updateQAStatus(qa.id, "answered")} className="px-3 py-1 bg-green-600 text-white rounded text-xs">回答受領</button>
               )}
               {qa.status === "answered" && (
-                <button onClick={() => updateQAStatus(qa.id, "distributed")} className="px-3 py-1 bg-purple-600 text-white rounded text-xs">全パートナーに配信</button>
+                <button onClick={() => updateQAStatus(qa.id, "distributed")} className="px-3 py-1 bg-purple-600 text-white rounded text-xs flex items-center gap-1">
+                  <span className="bg-purple-400 text-[8px] px-0.5 rounded">AI</span> 全パートナーにメール配信
+                </button>
               )}
             </div>
           </div>
@@ -782,7 +1070,7 @@ function QATab({ project, onUpdate }: { project: Project; onUpdate: () => void }
   );
 }
 
-// ===== ⑩⑪⑫ 成果物タブ =====
+// ===== ⑩⑪⑫ 成果物タブ（メール自動生成付き） =====
 function DeliverablesTab({ project, onUpdate }: { project: Project; onUpdate: () => void }) {
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ partnerId: "", workType: "", fileName: "", fileUrl: "", needsQC: true });
@@ -808,13 +1096,29 @@ function DeliverablesTab({ project, onUpdate }: { project: Project; onUpdate: ()
     onUpdate();
   };
 
-  const requestRevision = async (deliverableId: string) => {
+  const requestRevision = async (deliverableId: string, deliverable: Deliverable) => {
     const notes = prompt("修正指示内容を入力してください");
     if (!notes) return;
     await fetch(`/api/deliverables/${deliverableId}/revisions`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ revisionNotes: notes }),
+    });
+    // 修正依頼メールを自動生成
+    await fetch("/api/ai/generate-email", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        projectId: project.id,
+        emailType: "revision_request",
+        context: {
+          partnerEmail: deliverable.partner.email,
+          partnerName: deliverable.partner.name,
+          workType: deliverable.workType,
+          revisionNotes: notes,
+          fileName: deliverable.fileName,
+        },
+      }),
     });
     onUpdate();
   };
@@ -825,6 +1129,21 @@ function DeliverablesTab({ project, onUpdate }: { project: Project; onUpdate: ()
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ status: "delivered", deliveredAt: new Date().toISOString() }),
     });
+    // 納品通知メールを自動生成
+    await fetch("/api/ai/generate-email", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ projectId: project.id, emailType: "delivery_notification" }),
+    });
+    onUpdate();
+  };
+
+  const generateReminders = async () => {
+    await fetch("/api/ai/generate-email", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ projectId: project.id, emailType: "deliverable_reminder" }),
+    });
     onUpdate();
   };
 
@@ -833,6 +1152,9 @@ function DeliverablesTab({ project, onUpdate }: { project: Project; onUpdate: ()
       <div className="flex items-center justify-between">
         <h3 className="font-semibold text-gray-900">成果物管理・品質チェック・統合</h3>
         <div className="flex gap-2">
+          <button onClick={generateReminders} className="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 text-sm font-medium flex items-center gap-1">
+            <span className="text-xs bg-purple-400 px-1 rounded">AI</span> 進捗確認メール生成
+          </button>
           <button onClick={() => setShowForm(true)} className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium">
             + 成果物を登録
           </button>
@@ -894,13 +1216,13 @@ function DeliverablesTab({ project, onUpdate }: { project: Project; onUpdate: ()
               {d.status === "qc_review" && (
                 <div className="flex gap-1">
                   <button onClick={() => updateDeliverable(d.id, { status: "approved" })} className="px-2 py-1 bg-green-600 text-white rounded text-xs">承認</button>
-                  <button onClick={() => requestRevision(d.id)} className="px-2 py-1 bg-orange-600 text-white rounded text-xs">修正依頼</button>
+                  <button onClick={() => requestRevision(d.id, d)} className="px-2 py-1 bg-orange-600 text-white rounded text-xs">修正依頼</button>
                 </div>
               )}
               {d.status === "revision_submitted" && (
                 <div className="flex gap-1">
                   <button onClick={() => updateDeliverable(d.id, { status: "approved" })} className="px-2 py-1 bg-green-600 text-white rounded text-xs">承認</button>
-                  <button onClick={() => requestRevision(d.id)} className="px-2 py-1 bg-orange-600 text-white rounded text-xs">再修正</button>
+                  <button onClick={() => requestRevision(d.id, d)} className="px-2 py-1 bg-orange-600 text-white rounded text-xs">再修正</button>
                 </div>
               )}
               {d.status === "approved" && (
@@ -927,6 +1249,326 @@ function DeliverablesTab({ project, onUpdate }: { project: Project; onUpdate: ()
           )}
         </div>
       ))}
+    </div>
+  );
+}
+
+// ===== AI メール管理タブ（PM承認ワークフロー） =====
+function EmailManagementTab({ project, onUpdate }: { project: Project; onUpdate: () => void }) {
+  const [editingDraft, setEditingDraft] = useState<EmailDraft | null>(null);
+  const [editSubject, setEditSubject] = useState("");
+  const [editBody, setEditBody] = useState("");
+  const [filter, setFilter] = useState<string>("all");
+  const [generating, setGenerating] = useState(false);
+  const [customerReplyContext, setCustomerReplyContext] = useState("");
+  const [customerReplyContent, setCustomerReplyContent] = useState("");
+  const [showCustomerReply, setShowCustomerReply] = useState(false);
+
+  const drafts = project.emailDrafts.filter((d) => {
+    if (filter === "all") return true;
+    return d.status === filter;
+  });
+
+  const startEdit = (draft: EmailDraft) => {
+    setEditingDraft(draft);
+    setEditSubject(draft.subject);
+    setEditBody(draft.body);
+  };
+
+  const saveDraft = async (status: string) => {
+    if (!editingDraft) return;
+    await fetch(`/api/email-drafts/${editingDraft.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        subject: editSubject,
+        body: editBody,
+        recipientEmail: editingDraft.recipientEmail,
+        recipientName: editingDraft.recipientName,
+        status,
+      }),
+    });
+    setEditingDraft(null);
+    onUpdate();
+  };
+
+  const deleteDraft = async (id: string) => {
+    await fetch(`/api/email-drafts/${id}`, { method: "DELETE" });
+    onUpdate();
+  };
+
+  const generateCustomerReply = async () => {
+    setGenerating(true);
+    await fetch("/api/ai/generate-email", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        projectId: project.id,
+        emailType: "customer_reply",
+        context: {
+          replyContext: customerReplyContext,
+          replyContent: customerReplyContent,
+        },
+      }),
+    });
+    setGenerating(false);
+    setShowCustomerReply(false);
+    setCustomerReplyContext("");
+    setCustomerReplyContent("");
+    onUpdate();
+  };
+
+  const draftCounts = {
+    all: project.emailDrafts.length,
+    draft: project.emailDrafts.filter((d) => d.status === "draft").length,
+    approved: project.emailDrafts.filter((d) => d.status === "approved").length,
+    sent: project.emailDrafts.filter((d) => d.status === "sent").length,
+  };
+
+  return (
+    <div className="space-y-6">
+      {/* ヘッダー */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <span className="bg-purple-600 text-white text-xs font-bold px-2 py-1 rounded">AI</span>
+          <h3 className="font-semibold text-gray-900">メール管理（AI自動生成 → PM確認 → 送信）</h3>
+        </div>
+        <button
+          onClick={() => setShowCustomerReply(true)}
+          className="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 text-sm font-medium flex items-center gap-1"
+        >
+          <span className="text-xs bg-purple-400 px-1 rounded">AI</span> 顧客返信メール作成
+        </button>
+      </div>
+
+      {/* 顧客返信フォーム */}
+      {showCustomerReply && (
+        <div className="bg-gradient-to-r from-purple-50 to-blue-50 rounded-lg border-2 border-purple-200 p-6">
+          <h4 className="font-medium text-gray-900 mb-3">顧客返信メール（AI自動生成）</h4>
+          <p className="text-sm text-gray-600 mb-3">
+            返信の背景と内容を入力すると、AIがビジネスメールを自動作成します。
+          </p>
+          <div className="space-y-3">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">返信の背景・文脈</label>
+              <input
+                type="text"
+                value={customerReplyContext}
+                onChange={(e) => setCustomerReplyContext(e.target.value)}
+                className="w-full border rounded-lg px-3 py-2 text-sm"
+                placeholder="例：納期の前倒し依頼について"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">伝えたい内容</label>
+              <textarea
+                value={customerReplyContent}
+                onChange={(e) => setCustomerReplyContent(e.target.value)}
+                className="w-full border rounded-lg px-3 py-2 text-sm"
+                rows={3}
+                placeholder="例：3日間の前倒しは対応可能です。パートナーと調整の上、改めてスケジュールをご連絡します。"
+              />
+            </div>
+            <div className="flex gap-2">
+              <button
+                onClick={generateCustomerReply}
+                disabled={generating}
+                className="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:opacity-50 text-sm font-medium"
+              >
+                {generating ? "生成中..." : "AIメール生成"}
+              </button>
+              <button
+                onClick={() => setShowCustomerReply(false)}
+                className="px-4 py-2 bg-gray-200 rounded-lg text-sm"
+              >
+                キャンセル
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* フィルター */}
+      <div className="flex gap-2">
+        {[
+          { key: "all", label: `全て (${draftCounts.all})` },
+          { key: "draft", label: `承認待ち (${draftCounts.draft})` },
+          { key: "approved", label: `承認済み (${draftCounts.approved})` },
+          { key: "sent", label: `送信済み (${draftCounts.sent})` },
+        ].map((f) => (
+          <button
+            key={f.key}
+            onClick={() => setFilter(f.key)}
+            className={`px-3 py-1 rounded-full text-sm ${
+              filter === f.key ? "bg-blue-600 text-white" : "bg-gray-100 text-gray-600 hover:bg-gray-200"
+            }`}
+          >
+            {f.label}
+          </button>
+        ))}
+      </div>
+
+      {/* 編集モーダル */}
+      {editingDraft && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-8">
+          <div className="bg-white rounded-xl shadow-2xl w-full max-w-3xl max-h-[90vh] overflow-y-auto">
+            <div className="p-6 border-b">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <h4 className="font-semibold text-lg text-gray-900">メール確認・編集</h4>
+                  {editingDraft.aiGenerated && (
+                    <span className="bg-purple-100 text-purple-700 text-xs px-2 py-0.5 rounded">AI生成</span>
+                  )}
+                </div>
+                <button onClick={() => setEditingDraft(null)} className="text-gray-400 hover:text-gray-600 text-xl">X</button>
+              </div>
+            </div>
+            <div className="p-6 space-y-4">
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">種類</label>
+                  <p className="text-sm text-gray-600 bg-gray-50 px-3 py-2 rounded">{EMAIL_TYPE_LABELS[editingDraft.emailType] || editingDraft.emailType}</p>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">宛先</label>
+                  <p className="text-sm text-gray-600 bg-gray-50 px-3 py-2 rounded">
+                    {editingDraft.recipientName} &lt;{editingDraft.recipientEmail}&gt;
+                  </p>
+                </div>
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">件名</label>
+                <input
+                  type="text"
+                  value={editSubject}
+                  onChange={(e) => setEditSubject(e.target.value)}
+                  className="w-full border rounded-lg px-3 py-2 text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">本文</label>
+                <textarea
+                  value={editBody}
+                  onChange={(e) => setEditBody(e.target.value)}
+                  className="w-full border rounded-lg px-3 py-2 text-sm font-mono"
+                  rows={16}
+                />
+              </div>
+            </div>
+            <div className="p-6 border-t bg-gray-50 flex items-center justify-between">
+              <button
+                onClick={() => saveDraft("rejected")}
+                className="px-4 py-2 bg-red-100 text-red-700 rounded-lg hover:bg-red-200 text-sm"
+              >
+                却下
+              </button>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => saveDraft("draft")}
+                  className="px-4 py-2 bg-gray-200 rounded-lg text-sm"
+                >
+                  下書き保存
+                </button>
+                <button
+                  onClick={() => saveDraft("approved")}
+                  className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium"
+                >
+                  承認する
+                </button>
+                <button
+                  onClick={() => saveDraft("sent")}
+                  className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 text-sm font-medium"
+                >
+                  承認して送信
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* メール一覧 */}
+      {drafts.length === 0 ? (
+        <div className="bg-white rounded-lg shadow-sm border p-12 text-center">
+          <p className="text-gray-500">メール下書きはありません</p>
+          <p className="text-sm text-gray-400 mt-1">各タブの操作に応じてAIが自動的にメールを生成します</p>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {drafts.map((draft) => (
+            <div
+              key={draft.id}
+              className={`bg-white rounded-lg shadow-sm border p-4 ${
+                draft.status === "draft" ? "border-l-4 border-l-yellow-400" :
+                draft.status === "approved" ? "border-l-4 border-l-blue-400" :
+                draft.status === "sent" ? "border-l-4 border-l-green-400" :
+                "border-l-4 border-l-red-400"
+              }`}
+            >
+              <div className="flex items-start justify-between">
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2 mb-1">
+                    <span className={`text-xs px-2 py-0.5 rounded font-medium ${
+                      draft.status === "draft" ? "bg-yellow-100 text-yellow-700" :
+                      draft.status === "approved" ? "bg-blue-100 text-blue-700" :
+                      draft.status === "sent" ? "bg-green-100 text-green-700" :
+                      "bg-red-100 text-red-700"
+                    }`}>
+                      {EMAIL_STATUS_LABELS[draft.status]}
+                    </span>
+                    <span className="text-xs bg-gray-100 text-gray-600 px-2 py-0.5 rounded">
+                      {EMAIL_TYPE_LABELS[draft.emailType] || draft.emailType}
+                    </span>
+                    {draft.aiGenerated && (
+                      <span className="text-xs bg-purple-100 text-purple-700 px-1 py-0.5 rounded">AI</span>
+                    )}
+                  </div>
+                  <p className="font-medium text-gray-900 text-sm truncate">{draft.subject}</p>
+                  <p className="text-xs text-gray-500 mt-0.5">
+                    宛先: {draft.recipientName} &lt;{draft.recipientEmail}&gt;
+                    {" / "}
+                    {new Date(draft.createdAt).toLocaleString("ja-JP")}
+                  </p>
+                </div>
+                <div className="flex gap-1 ml-4">
+                  {draft.status === "draft" && (
+                    <>
+                      <button
+                        onClick={() => startEdit(draft)}
+                        className="px-3 py-1 bg-blue-600 text-white rounded text-xs hover:bg-blue-700"
+                      >
+                        確認・編集
+                      </button>
+                      <button
+                        onClick={() => deleteDraft(draft.id)}
+                        className="px-3 py-1 bg-red-100 text-red-600 rounded text-xs hover:bg-red-200"
+                      >
+                        削除
+                      </button>
+                    </>
+                  )}
+                  {draft.status === "approved" && (
+                    <button
+                      onClick={() => startEdit(draft)}
+                      className="px-3 py-1 bg-green-600 text-white rounded text-xs hover:bg-green-700"
+                    >
+                      送信
+                    </button>
+                  )}
+                  {(draft.status === "sent" || draft.status === "rejected") && (
+                    <button
+                      onClick={() => startEdit(draft)}
+                      className="px-3 py-1 bg-gray-200 text-gray-600 rounded text-xs hover:bg-gray-300"
+                    >
+                      詳細
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
